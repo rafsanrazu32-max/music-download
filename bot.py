@@ -63,21 +63,23 @@ http_session.headers.update({
     "Accept-Language": "en-US,en;q=0.9"
 })
 
-# Bounded caches
-SEARCH_CACHE = OrderedDict()         # {chat_id: OrderedDict({vid: meta})}
-LAST_SEARCH_RESULTS = OrderedDict()  # {chat_id: [vid1, vid2, ...]}
-DIRECT_VIDEO_CACHE = OrderedDict()   # {chat_id: vid}
+# Bounded per-chat caches
+SEARCH_CACHE = OrderedDict()           # {chat_id: OrderedDict({vid: meta})}
+LAST_SEARCH_ITEMS = OrderedDict()      # {chat_id: [{"id": vid, "title": title, ...}]}
+DIRECT_VIDEO_CACHE = OrderedDict()     # {chat_id: vid}
+PENDING_VIDEO_QUALITY = OrderedDict()  # {chat_id: vid}
+FILE_PICKER_MAP = OrderedDict()        # {chat_id: {button_label: vid}}
 MAX_CACHED_CHATS = 200
 MAX_ITEMS_PER_CHAT = 20
 
 # Admin interactive states {admin_id: state_str}
 ADMIN_STATE = {}
 
-# Persistent-during-runtime user & stats database
+# Runtime user & stats database
 DB_LOCK = threading.Lock()
 DB = {
-    "users": {},    # {str(user_id): {...}}
-    "recent": []    # [{"user_id": int, "name": str, "username": str, "title": str, "type": str, "time": str}]
+    "users": {},
+    "recent": []
 }
 
 BD_TZ = timezone(timedelta(hours=6))
@@ -102,7 +104,6 @@ def load_db():
                     DB["users"] = data.get("users", {})
                     DB["recent"] = data.get("recent", [])
                 elif isinstance(data, list):
-                    # Migrate old list format [uid1, uid2]
                     for uid in data:
                         suid = str(uid)
                         DB["users"][suid] = {
@@ -130,7 +131,6 @@ def save_db():
 
 
 def ensure_user_in_db(user) -> tuple[bool, int]:
-    """Ensure user exists in DB. Returns (is_new, total_users)."""
     if not user:
         return False, len(DB["users"])
     suid = str(user.id)
@@ -184,7 +184,7 @@ def record_download(user, title: str, media_fmt: str):
     with DB_LOCK:
         u = DB["users"][suid]
         u["downloads"] = u.get("downloads", 0) + 1
-        if media_fmt == "MP3":
+        if media_fmt.startswith("MP3"):
             u["audio_downloads"] = u.get("audio_downloads", 0) + 1
         else:
             u["video_downloads"] = u.get("video_downloads", 0) + 1
@@ -210,7 +210,6 @@ def record_download(user, title: str, media_fmt: str):
 
 
 def notify_admin_new_user(message, total_users: int):
-    """Send full user details to ADMIN_IDS when a user starts the bot for the first time."""
     if not ADMIN_IDS or not message.from_user:
         return
 
@@ -262,7 +261,7 @@ def notify_admin_new_user(message, total_users: int):
 
 
 # ============================================================
-# Colored Reply Keyboards (NO Inline Buttons)
+# Colored Reply Keyboards (Collapsible via Voice-Bar Toggle)
 # ============================================================
 
 def kb_btn(text: str, style: str = None) -> types.KeyboardButton:
@@ -273,7 +272,7 @@ def kb_btn(text: str, style: str = None) -> types.KeyboardButton:
 
 
 def get_main_keyboard(user_id: int = 0) -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
     markup.row(
         kb_btn("🔍 Search Music", style="primary"),
         kb_btn("⚡ Server Status", style="success")
@@ -288,7 +287,7 @@ def get_main_keyboard(user_id: int = 0) -> types.ReplyKeyboardMarkup:
 
 
 def get_search_results_keyboard(count: int) -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
     number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     for i in range(min(count, 5)):
         em = number_emojis[i]
@@ -296,22 +295,74 @@ def get_search_results_keyboard(count: int) -> types.ReplyKeyboardMarkup:
             kb_btn(f"{em} 🎵 MP3", style="success"),
             kb_btn(f"{em} 🎬 MP4", style="primary")
         )
+    markup.row(
+        kb_btn("📁 Send as File", style="success"),
+        kb_btn("🔙 Main Menu", style="danger")
+    )
+    return markup
+
+
+def get_video_quality_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
+    markup.row(
+        kb_btn("🎬 HD", style="success"),
+        kb_btn("🔥 1080p", style="primary")
+    )
+    markup.row(
+        kb_btn("📱 144p", style="primary"),
+        kb_btn("📁 Send as File", style="success")
+    )
     markup.row(kb_btn("🔙 Main Menu", style="danger"))
     return markup
 
 
 def get_direct_link_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
     markup.row(
         kb_btn("🎵 Download MP3 (192k)", style="success"),
-        kb_btn("🎬 Download MP4 (HD)", style="primary")
+        kb_btn("🎬 Download MP4", style="primary")
     )
-    markup.row(kb_btn("❌ Cancel", style="danger"))
+    markup.row(
+        kb_btn("📁 Send as File", style="success"),
+        kb_btn("❌ Cancel", style="danger")
+    )
+    return markup
+
+
+def get_file_picker_keyboard(chat_id: int, items: list) -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
+    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    mapping = {}
+
+    for idx, item in enumerate(items[:5]):
+        em = number_emojis[idx]
+        short_title = item.get("title", "Song").strip()
+        if len(short_title) > 28:
+            short_title = short_title[:25].rstrip() + "..."
+        btn_label = f"{em} 📁 {short_title}"
+        mapping[btn_label] = item["id"]
+        markup.row(kb_btn(btn_label, style="success"))
+
+    set_bounded_dict(FILE_PICKER_MAP, chat_id, mapping)
+    markup.row(kb_btn("🔙 Main Menu", style="danger"))
+    return markup
+
+
+def get_post_download_keyboard(chat_id: int) -> types.ReplyKeyboardMarkup:
+    """Keep Send as File + Main Menu right after delivery."""
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
+    if LAST_SEARCH_ITEMS.get(chat_id):
+        markup.row(
+            kb_btn("📁 Send as File", style="success"),
+            kb_btn("🔙 Main Menu", style="danger")
+        )
+    else:
+        markup.row(kb_btn("🔙 Main Menu", style="danger"))
     return markup
 
 
 def get_admin_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
     markup.row(
         kb_btn("👥 All Users", style="primary"),
         kb_btn("📊 User Stats", style="success")
@@ -325,13 +376,12 @@ def get_admin_keyboard() -> types.ReplyKeyboardMarkup:
 
 
 def get_admin_back_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, is_persistent=False)
     markup.row(kb_btn("🔙 Back to Admin Panel", style="danger"))
     return markup
 
 
 def send_long_message(chat_id: int, text: str, reply_markup=None):
-    """Safely send messages exceeding Telegram's 4096 character limit."""
     if len(text) <= 4000:
         bot.send_message(chat_id, text, reply_markup=reply_markup)
         return
@@ -353,19 +403,26 @@ def send_long_message(chat_id: int, text: str, reply_markup=None):
         try:
             bot.send_message(chat_id, chunk, reply_markup=rm)
         except Exception:
-            # Fallback without HTML in case a split broke a tag
             plain = re.sub(r"<[^>]+>", "", chunk)
             bot.send_message(chat_id, plain, parse_mode=None, reply_markup=rm)
 
 
 # ============================================================
-# Core Helpers & Download Engine
+# Cache & Media Helpers
 # ============================================================
 
 class FileTooLargeError(Exception):
     def __init__(self, size_bytes: int):
         self.size_bytes = size_bytes
         super().__init__(f"File size {size_bytes} exceeds 50 MB limit")
+
+
+def set_bounded_dict(store: OrderedDict, key, value):
+    if key in store:
+        store.move_to_end(key)
+    elif len(store) >= MAX_CACHED_CHATS:
+        store.popitem(last=False)
+    store[key] = value
 
 
 def cache_put(chat_id: int, vid: str, meta: dict):
@@ -381,22 +438,6 @@ def cache_put(chat_id: int, vid: str, meta: dict):
     chat_cache.move_to_end(vid)
     while len(chat_cache) > MAX_ITEMS_PER_CHAT:
         chat_cache.popitem(last=False)
-
-
-def set_last_search(chat_id: int, vids: list):
-    if chat_id in LAST_SEARCH_RESULTS:
-        LAST_SEARCH_RESULTS.move_to_end(chat_id)
-    elif len(LAST_SEARCH_RESULTS) >= MAX_CACHED_CHATS:
-        LAST_SEARCH_RESULTS.popitem(last=False)
-    LAST_SEARCH_RESULTS[chat_id] = vids
-
-
-def set_direct_video(chat_id: int, vid: str):
-    if chat_id in DIRECT_VIDEO_CACHE:
-        DIRECT_VIDEO_CACHE.move_to_end(chat_id)
-    elif len(DIRECT_VIDEO_CACHE) >= MAX_CACHED_CHATS:
-        DIRECT_VIDEO_CACHE.popitem(last=False)
-    DIRECT_VIDEO_CACHE[chat_id] = vid
 
 
 def parse_duration_seconds(d_str: str) -> int:
@@ -602,6 +643,161 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> bool:
         return False
 
 
+def probe_video_streams(file_path: str) -> tuple:
+    """Return (vcodec, acodec, width, height) using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,codec_name,width,height",
+        "-of", "json",
+        file_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+        if res.returncode != 0:
+            return None, None, 0, 0
+        info = json.loads(res.stdout.decode("utf-8", errors="ignore"))
+        vcodec = None
+        acodec = None
+        width = 0
+        height = 0
+        for s in info.get("streams", []):
+            ctype = s.get("codec_type")
+            if ctype == "video" and not vcodec:
+                vcodec = (s.get("codec_name") or "").lower()
+                width = int(s.get("width") or 0)
+                height = int(s.get("height") or 0)
+            elif ctype == "audio" and not acodec:
+                acodec = (s.get("codec_name") or "").lower()
+        return vcodec, acodec, width, height
+    except Exception:
+        return None, None, 0, 0
+
+
+def ensure_phone_compatible_mp4(input_path: str, output_path: str, target_quality: str) -> tuple[str, int, int]:
+    """
+    Ensure video is H.264 + AAC + yuv420p + faststart so Android/iOS Gallery
+    and Phone Downloads save & play it cleanly. Returns (final_path, width, height).
+    """
+    vcodec, acodec, w, h = probe_video_streams(input_path)
+
+    if target_quality == "144p":
+        needs_reencode = (h > 200) or (vcodec != "h264") or (acodec not in ("aac", "mp3", None))
+        if needs_reencode:
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:144",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart", "-threads", "1",
+                output_path
+            ]
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+                if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                    _, _, nw, nh = probe_video_streams(output_path)
+                    return output_path, nw, nh
+            except Exception as e:
+                logger.warning(f"144p transcode warning: {e}")
+
+    # If video is NOT H.264 (e.g. vp9/av1), transcode to H.264 so Gallery accepts it
+    if vcodec and vcodec != "h264":
+        scale_filter = ["-vf", "scale=-2:720"] if (target_quality == "HD" and h > 720) else []
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            *scale_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-threads", "1",
+            output_path
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
+            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                _, _, nw, nh = probe_video_streams(output_path)
+                return output_path, nw, nh
+        except Exception as e:
+            logger.warning(f"H.264 transcode warning: {e}")
+
+    # Already H.264: fast lossless remux with +faststart (or transcode audio to aac if opus)
+    audio_opts = ["-c:a", "copy"] if acodec in ("aac", "mp3", None) else ["-c:a", "aac", "-b:a", "128k"]
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "copy", *audio_opts,
+        "-movflags", "+faststart",
+        output_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            _, _, nw, nh = probe_video_streams(output_path)
+            return output_path, (nw or w), (nh or h)
+    except Exception as e:
+        logger.warning(f"faststart remux warning: {e}")
+
+    return input_path, w, h
+
+
+def pick_video_stream_from_api(vid: str, target_quality: str) -> tuple[str, str, bool]:
+    """Query API for optimal MP4 stream matching requested quality (144p, HD, 1080p)."""
+    target_height = {"144p": 144, "HD": 720, "1080p": 1080}.get(target_quality, 720)
+    fallback_url = f"{API_BASE}/down?url={vid}&format=mp4"
+
+    # Try passing quality param, then /best without quality
+    endpoints = [
+        f"{API_BASE}/best?url={vid}&format=mp4&quality={target_height}",
+        f"{API_BASE}/best?url={vid}&format=mp4"
+    ]
+
+    for ep in endpoints:
+        try:
+            r = http_session.get(ep, timeout=10)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not data.get("success"):
+                continue
+
+            title = data.get("video", {}).get("title", "")
+            selected = data.get("selected", {})
+            dl_url = selected.get("download", fallback_url)
+            has_audio = selected.get("hasAudio", True)
+
+            # If API returned a list of formats, look for matching height (prefer H.264/mp4)
+            formats = data.get("formats") or data.get("qualities") or data.get("streams") or []
+            if isinstance(formats, list) and formats:
+                mp4_candidates = []
+                for fmt in formats:
+                    if not isinstance(fmt, dict):
+                        continue
+                    f_url = fmt.get("download") or fmt.get("url")
+                    if not f_url:
+                        continue
+                    q_label = str(fmt.get("qualityLabel") or fmt.get("quality") or fmt.get("height") or "")
+                    m_h = re.search(r"(\d{3,4})", q_label)
+                    f_height = int(fmt.get("height") or (m_h.group(1) if m_h else 0) or 0)
+                    f_mime = str(fmt.get("mimeType") or fmt.get("ext") or fmt.get("container") or "").lower()
+                    f_has_video = fmt.get("hasVideo", True)
+                    if not f_has_video:
+                        continue
+                    if "mp4" in f_mime or "avc" in f_mime or not f_mime:
+                        score_h = abs(f_height - target_height) if f_height else 9999
+                        is_avc = 0 if "avc" in f_mime else 1
+                        no_aud = 0 if fmt.get("hasAudio", True) else 1
+                        mp4_candidates.append((score_h, is_avc, no_aud, f_url, fmt.get("hasAudio", True)))
+
+                if mp4_candidates:
+                    mp4_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+                    best = mp4_candidates[0]
+                    dl_url = best[3]
+                    has_audio = best[4]
+
+            return title, dl_url, has_audio
+        except Exception as err:
+            logger.warning(f"Stream query warning ({ep}): {err}")
+
+    return "", fallback_url, True
+
+
 def safe_edit_message(text: str, chat_id: int, message_id: int):
     try:
         bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
@@ -693,7 +889,8 @@ def get_bold_start_text(user) -> str:
         f"✨ <b>Hi, {mention}!</b> Turn a YouTube link or title into audio or video.\n\n"
         "<blockquote>"
         "🎵 <b>Download MP3 audio</b> — 192 kbps + Cover Art\n"
-        "🎬 <b>Download MP4 video</b> — HD Quality\n"
+        "🎬 <b>Download MP4 video</b> — HD / 1080p / 144p\n"
+        "📁 <b>Send as File</b> — Direct Phone Save Support\n"
         "🔍 <b>Search YouTube</b> — Instant Results"
         "</blockquote>\n\n"
         "💡 <i>Use a title, artist, or direct YouTube link.</i>\n"
@@ -704,8 +901,8 @@ def get_bold_start_text(user) -> str:
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     uid = message.from_user.id if message.from_user else 0
-    if uid in ADMIN_STATE:
-        ADMIN_STATE.pop(uid, None)
+    ADMIN_STATE.pop(uid, None)
+    PENDING_VIDEO_QUALITY.pop(message.chat.id, None)
 
     text = get_bold_start_text(message.from_user)
     bot.reply_to(message, text, reply_markup=get_main_keyboard(uid))
@@ -775,7 +972,7 @@ def send_server_status(chat_id: int, user_id: int):
             "<blockquote>"
             "⚡ <b>Streaming Engine:</b> Active\n"
             "🎵 <b>Audio Quality:</b> 192 kbps MP3 (ID3)\n"
-            "🎬 <b>Video Quality:</b> HD MP4\n"
+            "🎬 <b>Video Quality:</b> HD / 1080p / 144p MP4\n"
             "🚀 <b>Network:</b> Cloud-Accelerated CDN"
             "</blockquote>\n\n"
             "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
@@ -851,7 +1048,6 @@ def handle_admin_user_stats(chat_id: int, admin_id: int):
         bot.send_message(chat_id, "📊 এখনো কোনো ইউজার ডেটা নেই।", reply_markup=get_admin_keyboard())
         return
 
-    # Sort by downloads desc, then searches desc
     users_sorted = sorted(
         users_list,
         key=lambda x: (x.get("downloads", 0), x.get("searches", 0)),
@@ -967,8 +1163,24 @@ def handle_admin_user_lookup(chat_id: int, admin_id: int, query_str: str):
 
 
 # ============================================================
-# Text & Reply Keyboard Button Router
+# Text & Reply Keyboard Router
 # ============================================================
+
+def prompt_video_quality(chat_id: int, vid: str):
+    meta = fetch_video_metadata(chat_id, vid)
+    title = html.escape(meta.get("title", "YouTube Video"))
+    set_bounded_dict(PENDING_VIDEO_QUALITY, chat_id, vid)
+    bot.send_message(
+        chat_id,
+        "🎬 <b>Select Video Quality</b>\n\n"
+        "<blockquote>"
+        f"📌 <b>Title:</b> {title}\n"
+        f"⏰ <b>Duration:</b> <code>{meta.get('duration', '—')}</code>"
+        "</blockquote>\n\n"
+        "👇 <i>নিচের কিবোর্ড থেকে ভিডিও কোয়ালিটি বেছে নিন:</i>",
+        reply_markup=get_video_quality_keyboard()
+    )
+
 
 @bot.message_handler(content_types=["text"], func=lambda msg: bool(msg.text and not msg.text.startswith("/")))
 def handle_text_query(message):
@@ -981,9 +1193,10 @@ def handle_text_query(message):
     uid = user.id if user else 0
     ensure_user_in_db(user)
 
-    # 1) Main Menu & Cancel Keyboard Buttons
+    # 1) Navigation & Main Menu Buttons
     if text == "🔙 Main Menu" or text == "❌ Cancel":
         ADMIN_STATE.pop(uid, None)
+        PENDING_VIDEO_QUALITY.pop(chat_id, None)
         bot.send_message(
             chat_id,
             "🏠 <b>Main Menu</b>\n💡 <i>যেকোনো গানের নাম বা YouTube লিংক পাঠান!</i>",
@@ -993,6 +1206,7 @@ def handle_text_query(message):
 
     if text == "✖️ Hide Menu":
         ADMIN_STATE.pop(uid, None)
+        PENDING_VIDEO_QUALITY.pop(chat_id, None)
         bot.send_message(
             chat_id,
             "✅ <b>Menu hidden.</b> আবার মেনু চালু করতে <code>/start</code> লিখুন।",
@@ -1022,7 +1236,7 @@ def handle_text_query(message):
         cmd_help(message)
         return
 
-    # 2) Admin Panel Keyboard Buttons (Strictly Admin Only)
+    # 2) Admin Panel Buttons (Strictly Admin Only)
     if text == "👑 Admin Panel":
         if is_admin(uid):
             open_admin_panel(chat_id, uid)
@@ -1058,19 +1272,72 @@ def handle_text_query(message):
         )
         return
 
-    # If Admin is currently entering a User ID / Username to inspect
     if is_admin(uid) and ADMIN_STATE.get(uid) == "awaiting_user_lookup":
         handle_admin_user_lookup(chat_id, uid, text)
         return
 
-    # 3) Search Result Keyboard Buttons (1️⃣ 🎵 MP3 / 1️⃣ 🎬 MP4 ... 5️⃣)
+    # 3) "📁 Send as File" -> Show Searched Songs in Keyboard
+    if text == "📁 Send as File":
+        items = LAST_SEARCH_ITEMS.get(chat_id, [])
+        if not items:
+            bot.send_message(
+                chat_id,
+                "⚠️ <b>কোনো সার্চ করা গান পাওয়া যায়নি।</b>\nপ্রথমে যেকোনো একটি গানের নাম লিখে সার্চ করুন।",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return
+
+        bot.send_message(
+            chat_id,
+            "📁 <b>Send as File (Phone Save Mode)</b>\n\n"
+            "👇 <i>আপনার সার্চ করা গান নিচে দেখানো হলো—যেকোনোটিতে ক্লিক করলে সেটি ফোনে সেভযোগ্য MP4 ফাইল হিসেবে আসবে:</i>",
+            reply_markup=get_file_picker_keyboard(chat_id, items)
+        )
+        return
+
+    # 4) User picked a song from "📁 Send as File" picker
+    picker_map = FILE_PICKER_MAP.get(chat_id, {})
+    if text in picker_map:
+        vid = picker_map[text]
+        process_download(message, "video", vid, quality="HD", as_document=True)
+        return
+
+    m_file_pick = re.match(r"^([1-5])️⃣\s*📁", text)
+    if m_file_pick:
+        idx = int(m_file_pick.group(1)) - 1
+        items = LAST_SEARCH_ITEMS.get(chat_id, [])
+        if 0 <= idx < len(items):
+            process_download(message, "video", items[idx]["id"], quality="HD", as_document=True)
+        else:
+            bot.send_message(chat_id, "⚠️ <b>Session expired.</b> আবার সার্চ করুন।", reply_markup=get_main_keyboard(uid))
+        return
+
+    # 5) Video Quality Buttons (HD / 144p / 1080p)
+    if text in ("🎬 HD", "🔥 1080p", "📱 144p"):
+        vid = PENDING_VIDEO_QUALITY.get(chat_id)
+        if not vid:
+            bot.send_message(
+                chat_id,
+                "⚠️ <b>Session expired.</b> অনুগ্রহ করে আবার গান সার্চ করে MP4 বেছে নিন।",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return
+        q_map = {"🎬 HD": "HD", "🔥 1080p": "1080p", "📱 144p": "144p"}
+        process_download(message, "video", vid, quality=q_map[text], as_document=False)
+        return
+
+    # 6) Search Result Buttons (1️⃣ 🎵 MP3 / 1️⃣ 🎬 MP4 ... 5️⃣)
     m_res = re.match(r"^([1-5])️⃣\s*(🎵 MP3|🎬 MP4)$", text)
     if m_res:
         idx = int(m_res.group(1)) - 1
         media_type = "audio" if "MP3" in m_res.group(2) else "video"
-        vids = LAST_SEARCH_RESULTS.get(chat_id, [])
-        if 0 <= idx < len(vids):
-            process_download(message, media_type, vids[idx])
+        items = LAST_SEARCH_ITEMS.get(chat_id, [])
+        if 0 <= idx < len(items):
+            vid = items[idx]["id"]
+            if media_type == "audio":
+                process_download(message, "audio", vid)
+            else:
+                prompt_video_quality(chat_id, vid)
         else:
             bot.send_message(
                 chat_id,
@@ -1079,7 +1346,7 @@ def handle_text_query(message):
             )
         return
 
-    # 4) Direct YouTube Link Keyboard Buttons
+    # 7) Direct YouTube Link Keyboard Buttons
     if text == "🎵 Download MP3 (192k)":
         vid = DIRECT_VIDEO_CACHE.get(chat_id)
         if vid:
@@ -1088,15 +1355,15 @@ def handle_text_query(message):
             bot.send_message(chat_id, "⚠️ <b>Link expired.</b> আবার লিংক পাঠান।", reply_markup=get_main_keyboard(uid))
         return
 
-    if text == "🎬 Download MP4 (HD)":
+    if text == "🎬 Download MP4":
         vid = DIRECT_VIDEO_CACHE.get(chat_id)
         if vid:
-            process_download(message, "video", vid)
+            prompt_video_quality(chat_id, vid)
         else:
             bot.send_message(chat_id, "⚠️ <b>Link expired.</b> আবার লিংক পাঠান।", reply_markup=get_main_keyboard(uid))
         return
 
-    # 5) Direct YouTube URL or Normal Search Query
+    # 8) Direct YouTube URL or Normal Search Query
     vid = extract_video_id(text)
     if vid:
         handle_direct_video(chat_id, user, vid)
@@ -1110,7 +1377,6 @@ def handle_text_query(message):
 # ============================================================
 
 def perform_search(chat_id: int, user, query: str):
-    uid = user.id if user else 0
     record_search(user)
     search_msg = bot.send_message(chat_id, f"🔍 <i>Searching for:</i> <b>{html.escape(query)}</b>...")
 
@@ -1123,11 +1389,9 @@ def perform_search(chat_id: int, user, query: str):
         )
         return
 
-    vids = []
     for r in results:
         cache_put(chat_id, r["id"], r)
-        vids.append(r["id"])
-    set_last_search(chat_id, vids)
+    set_bounded_dict(LAST_SEARCH_ITEMS, chat_id, results)
 
     number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     msg_lines = [
@@ -1146,12 +1410,12 @@ def perform_search(chat_id: int, user, query: str):
         views_info = f" • 👁 <code>{views}</code>" if views and views != "—" else ""
         msg_lines.append(f"└ 👤 <code>{clean_channel}</code> • ⏱ <code>{duration}</code>{views_info}\n")
 
-    msg_lines.append("</blockquote>\n👇 <b>নিচের রঙিন কিবোর্ড বাটন থেকে MP3 অথবা MP4 বেছে নিন:</b>")
+    msg_lines.append("</blockquote>\n👇 <b>নিচের রঙিন কিবোর্ড থেকে MP3, MP4 অথবা 📁 Send as File বেছে নিন:</b>")
 
     bot.edit_message_text("\n".join(msg_lines), chat_id=chat_id, message_id=search_msg.message_id)
     bot.send_message(
         chat_id,
-        "🎹 <i>নিচে ১–৫ নম্বরের বাটনগুলো দেওয়া হলো:</i>",
+        "🎹 <i>অপশনগুলো নিচের কিবোর্ডে দেওয়া হলো:</i>",
         reply_markup=get_search_results_keyboard(len(results))
     )
 
@@ -1173,7 +1437,8 @@ def handle_direct_video(chat_id: int, user, vid: str):
     except Exception:
         pass
 
-    set_direct_video(chat_id, vid)
+    set_bounded_dict(DIRECT_VIDEO_CACHE, chat_id, vid)
+    set_bounded_dict(LAST_SEARCH_ITEMS, chat_id, [meta])
 
     card_text = (
         "🎬 <b>YouTube Media Detected</b>\n\n"
@@ -1189,14 +1454,12 @@ def handle_direct_video(chat_id: int, user, vid: str):
     bot.send_message(chat_id, "🎹 <i>Format options:</i>", reply_markup=get_direct_link_keyboard())
 
 
-def process_download(message, media_type: str, vid: str):
+def process_download(message, media_type: str, vid: str, quality: str = "HD", as_document: bool = False):
     chat_id = message.chat.id
     user = message.from_user
     uid = user.id if user else 0
     is_audio = (media_type == "audio")
-    req_format = "m4a" if is_audio else "mp4"
 
-    # Downloaded by: @username or ID
     if user and user.username:
         downloaded_by = f"@{html.escape(user.username)}"
     else:
@@ -1226,46 +1489,48 @@ def process_download(message, media_type: str, vid: str):
         "</blockquote>"
     )
 
-    best_api_url = f"{API_BASE}/best?url={vid}&format={req_format}"
-    fallback_down_url = f"{API_BASE}/down?url={vid}&format={req_format}"
-    selected_download_url = fallback_down_url
+    selected_download_url = f"{API_BASE}/down?url={vid}&format={'m4a' if is_audio else 'mp4'}"
     temp_files = []
 
     try:
         video_has_audio = True
         audio_stream_url = None
 
-        try:
-            r_info = http_session.get(best_api_url, timeout=10)
-            if r_info.status_code == 200:
-                api_meta = r_info.json()
-                if api_meta.get("success"):
-                    title = api_meta.get("video", {}).get("title", title)
-                    clean_title = html.escape(title)
-                    selected_info = api_meta.get("selected", {})
-                    selected_download_url = selected_info.get("download", fallback_down_url)
-                    video_has_audio = selected_info.get("hasAudio", True)
-        except Exception as err:
-            logger.warning(f"Metadata query warning for {vid}: {err}")
-
-        needs_audio_mapping = (not is_audio) and (not video_has_audio)
-        if needs_audio_mapping:
+        if is_audio:
             try:
-                r_aud = http_session.get(f"{API_BASE}/best?url={vid}&format=m4a", timeout=10)
-                if r_aud.status_code == 200:
-                    d_aud = r_aud.json()
-                    if d_aud.get("success"):
-                        audio_stream_url = d_aud.get("selected", {}).get(
-                            "download", f"{API_BASE}/down?url={vid}&format=m4a"
-                        )
-            except Exception:
-                pass
+                r_info = http_session.get(f"{API_BASE}/best?url={vid}&format=m4a", timeout=10)
+                if r_info.status_code == 200:
+                    api_meta = r_info.json()
+                    if api_meta.get("success"):
+                        title = api_meta.get("video", {}).get("title", title)
+                        clean_title = html.escape(title)
+                        selected_download_url = api_meta.get("selected", {}).get("download", selected_download_url)
+            except Exception as err:
+                logger.warning(f"Audio query warning for {vid}: {err}")
+        else:
+            api_title, selected_download_url, video_has_audio = pick_video_stream_from_api(vid, quality)
+            if api_title:
+                title = api_title
+                clean_title = html.escape(title)
+
+            if not video_has_audio:
+                try:
+                    r_aud = http_session.get(f"{API_BASE}/best?url={vid}&format=m4a", timeout=10)
+                    if r_aud.status_code == 200:
+                        d_aud = r_aud.json()
+                        if d_aud.get("success"):
+                            audio_stream_url = d_aud.get("selected", {}).get(
+                                "download", f"{API_BASE}/down?url={vid}&format=m4a"
+                            )
+                except Exception:
+                    pass
 
         ext = "m4a" if is_audio else "mp4"
         raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
         temp_files.append(raw_tmp.name)
         raw_tmp.close()
 
+        media_label = "Audio" if is_audio else (f"Video ({quality})" if not as_document else "Video File")
         success = download_with_progress(
             url=selected_download_url,
             output_path=raw_tmp.name,
@@ -1275,7 +1540,7 @@ def process_download(message, media_type: str, vid: str):
             channel=channel,
             duration=duration_str,
             views=views_str,
-            media_type="Audio" if is_audio else "Video"
+            media_type=media_label
         )
 
         if not success:
@@ -1283,6 +1548,7 @@ def process_download(message, media_type: str, vid: str):
 
         final_file_path = raw_tmp.name
         actual_audio_ext = "m4a"
+        vid_w, vid_h = 0, 0
 
         if is_audio:
             safe_edit_message(
@@ -1301,40 +1567,55 @@ def process_download(message, media_type: str, vid: str):
             if convert_to_mp3(raw_tmp.name, mp3_tmp.name, title, channel):
                 final_file_path = mp3_tmp.name
                 actual_audio_ext = "mp3"
+        else:
+            working_video = raw_tmp.name
 
-        elif needs_audio_mapping and audio_stream_url:
+            if not video_has_audio and audio_stream_url:
+                safe_edit_message(
+                    "⚡ <b>Mapping Audio Track...</b>\n\n"
+                    "<blockquote>"
+                    f"🎬 <b>{clean_title}</b>\n"
+                    "🔊 Combining video with audio stream..."
+                    "</blockquote>",
+                    chat_id,
+                    status_msg.message_id
+                )
+                aud_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
+                temp_files.append(aud_tmp.name)
+                aud_tmp.close()
+
+                aud_ok = download_with_progress(
+                    url=audio_stream_url,
+                    output_path=aud_tmp.name,
+                    chat_id=chat_id,
+                    msg_id=status_msg.message_id,
+                    title=title,
+                    channel=channel,
+                    duration=duration_str,
+                    views=views_str,
+                    media_type="Audio Track"
+                )
+                if aud_ok:
+                    muxed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    temp_files.append(muxed_tmp.name)
+                    muxed_tmp.close()
+                    if mux_video_audio(raw_tmp.name, aud_tmp.name, muxed_tmp.name):
+                        working_video = muxed_tmp.name
+
             safe_edit_message(
-                "⚡ <b>Mapping Audio Track...</b>\n\n"
+                "📱 <b>Optimizing MP4 for Phone Save &amp; Gallery...</b>\n\n"
                 "<blockquote>"
                 f"🎬 <b>{clean_title}</b>\n"
-                "🔊 Combining high-definition video with audio stream..."
+                f"🛠 <b>Quality:</b> {quality}"
                 "</blockquote>",
                 chat_id,
                 status_msg.message_id
             )
-            aud_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
-            temp_files.append(aud_tmp.name)
-            aud_tmp.close()
+            compat_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            temp_files.append(compat_tmp.name)
+            compat_tmp.close()
 
-            aud_ok = download_with_progress(
-                url=audio_stream_url,
-                output_path=aud_tmp.name,
-                chat_id=chat_id,
-                msg_id=status_msg.message_id,
-                title=title,
-                channel=channel,
-                duration=duration_str,
-                views=views_str,
-                media_type="Audio Track"
-            )
-
-            if aud_ok:
-                muxed_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                temp_files.append(muxed_tmp.name)
-                muxed_tmp.close()
-
-                if mux_video_audio(raw_tmp.name, aud_tmp.name, muxed_tmp.name):
-                    final_file_path = muxed_tmp.name
+            final_file_path, vid_w, vid_h = ensure_phone_compatible_mp4(working_video, compat_tmp.name, quality)
 
         final_size = os.path.getsize(final_file_path)
         if final_size > MAX_FILE_SIZE_BYTES:
@@ -1355,13 +1636,23 @@ def process_download(message, media_type: str, vid: str):
             f"⏰ <b>Duration:</b> {duration_str}"
             "</blockquote>\n\n"
             "<code>[▰▰▰▰▰▰▰▰▰▰]</code> <b>100%</b>\n"
-            "📤 <i>Delivering track to your chat...</i>",
+            "📤 <i>Delivering to your chat...</i>",
             chat_id,
             status_msg.message_id
         )
 
-        fmt_label = f"{actual_audio_ext.upper()} audio" if is_audio else "MP4 video"
-        quality_label = "192 kbps" if is_audio else "HD 720p / 1080p"
+        if is_audio:
+            fmt_label = f"{actual_audio_ext.upper()} audio"
+            quality_label = "192 kbps"
+            dl_stat_type = "MP3"
+        elif as_document:
+            fmt_label = "MP4 File (Phone Save)"
+            quality_label = f"{quality} (H.264 MP4)"
+            dl_stat_type = "MP4 File"
+        else:
+            fmt_label = "MP4 video"
+            quality_label = {"144p": "144p", "HD": "HD (720p)", "1080p": "1080p Full HD"}.get(quality, quality)
+            dl_stat_type = f"MP4 {quality}"
 
         extra_lines = []
         if clean_views and clean_views != "—":
@@ -1372,6 +1663,7 @@ def process_download(message, media_type: str, vid: str):
         extra_lines_str = "\n".join(extra_lines)
 
         yt_link = f"https://www.youtube.com/watch?v={vid}"
+        direct_safe = html.escape(selected_download_url, quote=True)
         caption_text = (
             f"<b>{clean_title}</b>\n\n"
             "<blockquote>"
@@ -1381,12 +1673,13 @@ def process_download(message, media_type: str, vid: str):
             f"🎧 <b>Format:</b> {fmt_label}\n"
             f"🛠 <b>Quality:</b> {quality_label}\n"
             f"🙋‍♂️ <b>Downloaded by:</b> {downloaded_by}\n"
-            f"🔗 <a href=\"{yt_link}\">Open on YouTube</a>"
+            f"🔗 <a href=\"{yt_link}\">Open on YouTube</a>  •  📥 <a href=\"{direct_safe}\">Direct Save Link</a>"
             "</blockquote>\n\n"
             "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
         )
 
         clean_filename = re.sub(r'[\\/*?:"<>|]', "", title)[:50] or vid
+        post_kb = get_post_download_keyboard(chat_id)
         sent = False
 
         if is_audio:
@@ -1401,6 +1694,7 @@ def process_download(message, media_type: str, vid: str):
                             duration=duration_sec,
                             thumbnail=t_file,
                             caption=caption_text,
+                            reply_markup=post_kb,
                             timeout=120
                         )
                     sent = True
@@ -1417,6 +1711,7 @@ def process_download(message, media_type: str, vid: str):
                             performer=channel,
                             duration=duration_sec,
                             caption=caption_text,
+                            reply_markup=post_kb,
                             timeout=120
                         )
                     sent = True
@@ -1429,32 +1724,52 @@ def process_download(message, media_type: str, vid: str):
                         chat_id,
                         a_file,
                         caption=caption_text,
+                        reply_markup=post_kb,
                         visible_file_name=f"{clean_filename}.{actual_audio_ext}",
                         timeout=120
                     )
+
+        elif as_document:
+            if has_thumb:
+                with open(final_file_path, "rb") as d_file, open(thumb_tmp.name, "rb") as t_file:
+                    bot.send_document(
+                        chat_id,
+                        d_file,
+                        thumbnail=t_file,
+                        caption=caption_text,
+                        reply_markup=post_kb,
+                        visible_file_name=f"{clean_filename}.mp4",
+                        timeout=180
+                    )
+            else:
+                with open(final_file_path, "rb") as d_file:
+                    bot.send_document(
+                        chat_id,
+                        d_file,
+                        caption=caption_text,
+                        reply_markup=post_kb,
+                        visible_file_name=f"{clean_filename}.mp4",
+                        timeout=180
+                    )
         else:
+            video_kwargs = {
+                "caption": caption_text,
+                "duration": duration_sec,
+                "supports_streaming": True,
+                "reply_markup": post_kb,
+                "timeout": 180
+            }
+            if vid_w > 0 and vid_h > 0:
+                video_kwargs["width"] = vid_w
+                video_kwargs["height"] = vid_h
+
             try:
                 if has_thumb:
                     with open(final_file_path, "rb") as v_file, open(thumb_tmp.name, "rb") as t_file:
-                        bot.send_video(
-                            chat_id,
-                            v_file,
-                            caption=caption_text,
-                            duration=duration_sec,
-                            thumbnail=t_file,
-                            supports_streaming=True,
-                            timeout=180
-                        )
+                        bot.send_video(chat_id, v_file, thumbnail=t_file, **video_kwargs)
                 else:
                     with open(final_file_path, "rb") as v_file:
-                        bot.send_video(
-                            chat_id,
-                            v_file,
-                            caption=caption_text,
-                            duration=duration_sec,
-                            supports_streaming=True,
-                            timeout=180
-                        )
+                        bot.send_video(chat_id, v_file, **video_kwargs)
             except Exception as ev:
                 logger.warning(f"send_video failed: {ev}")
                 with open(final_file_path, "rb") as v_file:
@@ -1462,11 +1777,12 @@ def process_download(message, media_type: str, vid: str):
                         chat_id,
                         v_file,
                         caption=caption_text,
+                        reply_markup=post_kb,
                         visible_file_name=f"{clean_filename}.mp4",
                         timeout=180
                     )
 
-        record_download(user, title, "MP3" if is_audio else "MP4")
+        record_download(user, title, dl_stat_type)
 
         try:
             bot.delete_message(chat_id, status_msg.message_id)
