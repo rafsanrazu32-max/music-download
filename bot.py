@@ -12,9 +12,11 @@ import time
 import html
 import logging
 import tempfile
+import threading
 import subprocess
 import urllib.parse
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import requests
 from PIL import Image
@@ -30,6 +32,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_BASE = os.getenv("API_BASE", "https://honeysee-api.vqx.workers.dev").rstrip("/")
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot upload limit
+USERS_FILE = os.getenv("USERS_FILE", "users.json")
+
+# Parse single or comma-separated ADMIN_ID(s)
+ADMIN_IDS = []
+for _aid in os.getenv("ADMIN_ID", "").split(","):
+    _aid = _aid.strip()
+    if _aid.lstrip("-").isdigit():
+        ADMIN_IDS.append(int(_aid))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +66,99 @@ http_session.headers.update({
 SEARCH_CACHE = OrderedDict()
 MAX_CACHED_CHATS = 200
 MAX_ITEMS_PER_CHAT = 20
+
+USERS_LOCK = threading.Lock()
+KNOWN_USERS = set()
+
+
+def load_known_users():
+    global KNOWN_USERS
+    try:
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    KNOWN_USERS = set(int(uid) for uid in data)
+    except Exception as e:
+        logger.warning(f"Could not load {USERS_FILE}: {e}")
+
+
+def save_known_users():
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(KNOWN_USERS), f)
+    except Exception as e:
+        logger.warning(f"Could not save {USERS_FILE}: {e}")
+
+
+def register_user_if_new(user) -> tuple[bool, int]:
+    """Return (is_new, total_users) safely across threads."""
+    if not user:
+        return False, len(KNOWN_USERS)
+    with USERS_LOCK:
+        is_new = user.id not in KNOWN_USERS
+        if is_new:
+            KNOWN_USERS.add(user.id)
+            save_known_users()
+        return is_new, len(KNOWN_USERS)
+
+
+def notify_admin_new_user(message, total_users: int):
+    """Send full user details to ADMIN_IDS when a user starts the bot for the first time."""
+    if not ADMIN_IDS or not message.from_user:
+        return
+
+    user = message.from_user
+    first_name = html.escape(user.first_name or "—")
+    last_name = html.escape(user.last_name or "—")
+    full_name = html.escape(
+        f"{user.first_name or ''} {user.last_name or ''}".strip() or "Unknown"
+    )
+    mention = f'<a href="tg://user?id={user.id}">{full_name}</a>'
+    username = f"@{html.escape(user.username)}" if user.username else "None"
+    lang = html.escape(getattr(user, "language_code", None) or "Unknown")
+    is_premium = "Yes ⭐" if getattr(user, "is_premium", False) else "No"
+    is_bot = "Yes 🤖" if getattr(user, "is_bot", False) else "No"
+    chat_type = html.escape(message.chat.type or "private")
+
+    parts = (message.text or "").split(maxsplit=1)
+    start_param = html.escape(parts[1].strip()) if len(parts) > 1 else "None"
+
+    bd_tz = timezone(timedelta(hours=6))
+    now_str = datetime.now(bd_tz).strftime("%d-%m-%Y %I:%M:%S %p (BD)")
+
+    admin_text = (
+        "🆕 <b>New User Started the Bot!</b>\n\n"
+        "<blockquote>"
+        f"👤 <b>Profile:</b> {mention}\n"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"📛 <b>First Name:</b> {first_name}\n"
+        f"📛 <b>Last Name:</b> {last_name}\n"
+        f"🔗 <b>Username:</b> {username}\n"
+        f"🌐 <b>Language:</b> <code>{lang}</code>\n"
+        f"⭐ <b>Telegram Premium:</b> {is_premium}\n"
+        f"🤖 <b>Is Bot:</b> {is_bot}\n"
+        f"💬 <b>Chat Type:</b> <code>{chat_type}</code>\n"
+        f"🔑 <b>Start Param:</b> <code>{start_param}</code>\n"
+        f"🕒 <b>Time:</b> <code>{now_str}</code>\n"
+        f"👥 <b>Total Users:</b> <code>{total_users}</code>"
+        "</blockquote>"
+    )
+
+    markup = None
+    if user.username:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "🔗 Open User Profile", url=f"https://t.me/{user.username}"
+            )
+        )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(admin_id, admin_text, reply_markup=markup)
+        except Exception as e:
+            logger.warning(f"Failed to notify admin {admin_id}: {e}")
 
 
 class FileTooLargeError(Exception):
@@ -389,6 +492,14 @@ def get_clean_start_keyboard() -> types.InlineKeyboardMarkup:
 def cmd_start(message):
     text = get_bold_start_text(message.from_user)
     bot.reply_to(message, text, reply_markup=get_clean_start_keyboard())
+
+    is_new, total_users = register_user_if_new(message.from_user)
+    if is_new and ADMIN_IDS:
+        threading.Thread(
+            target=notify_admin_new_user,
+            args=(message, total_users),
+            daemon=True
+        ).start()
 
 
 @bot.message_handler(commands=["help"])
@@ -926,9 +1037,10 @@ def handle_download(call):
 
 
 def main():
+    load_known_users()
     print("=" * 60)
     print("🚀 XZ Music Bot is running!")
-    print("🤖 Connected to Telegram successfully...")
+    print(f"🤖 Connected to Telegram successfully... (Admins: {len(ADMIN_IDS)})")
     print("=" * 60)
     try:
         bot.remove_webhook()
