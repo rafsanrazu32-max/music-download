@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================
 # XZ Music & Video Downloader Bot
-# Developed by: https://t.me/XVIBERZ
+# Powered by: AYAN AHMED 🛐
 # ============================================================
 
 import os
@@ -63,44 +63,150 @@ http_session.headers.update({
     "Accept-Language": "en-US,en;q=0.9"
 })
 
-SEARCH_CACHE = OrderedDict()
+# Bounded caches
+SEARCH_CACHE = OrderedDict()         # {chat_id: OrderedDict({vid: meta})}
+LAST_SEARCH_RESULTS = OrderedDict()  # {chat_id: [vid1, vid2, ...]}
+DIRECT_VIDEO_CACHE = OrderedDict()   # {chat_id: vid}
 MAX_CACHED_CHATS = 200
 MAX_ITEMS_PER_CHAT = 20
 
-USERS_LOCK = threading.Lock()
-KNOWN_USERS = set()
+# Admin interactive states {admin_id: state_str}
+ADMIN_STATE = {}
+
+# Persistent-during-runtime user & stats database
+DB_LOCK = threading.Lock()
+DB = {
+    "users": {},    # {str(user_id): {...}}
+    "recent": []    # [{"user_id": int, "name": str, "username": str, "title": str, "type": str, "time": str}]
+}
+
+BD_TZ = timezone(timedelta(hours=6))
 
 
-def load_known_users():
-    global KNOWN_USERS
+def now_bd_str(short: bool = False) -> str:
+    fmt = "%d-%m %I:%M %p" if short else "%d-%m-%Y %I:%M:%S %p (BD)"
+    return datetime.now(BD_TZ).strftime(fmt)
+
+
+def is_admin(user_id: int) -> bool:
+    return bool(user_id and user_id in ADMIN_IDS)
+
+
+def load_db():
+    global DB
     try:
         if os.path.exists(USERS_FILE):
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list):
-                    KNOWN_USERS = set(int(uid) for uid in data)
+                if isinstance(data, dict) and "users" in data:
+                    DB["users"] = data.get("users", {})
+                    DB["recent"] = data.get("recent", [])
+                elif isinstance(data, list):
+                    # Migrate old list format [uid1, uid2]
+                    for uid in data:
+                        suid = str(uid)
+                        DB["users"][suid] = {
+                            "id": int(uid),
+                            "name": "User",
+                            "username": "",
+                            "joined_at": "Unknown",
+                            "last_active": "Unknown",
+                            "searches": 0,
+                            "downloads": 0,
+                            "audio_downloads": 0,
+                            "video_downloads": 0,
+                            "history": []
+                        }
     except Exception as e:
         logger.warning(f"Could not load {USERS_FILE}: {e}")
 
 
-def save_known_users():
+def save_db():
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(KNOWN_USERS), f)
+            json.dump(DB, f, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"Could not save {USERS_FILE}: {e}")
 
 
-def register_user_if_new(user) -> tuple[bool, int]:
-    """Return (is_new, total_users) safely across threads."""
+def ensure_user_in_db(user) -> tuple[bool, int]:
+    """Ensure user exists in DB. Returns (is_new, total_users)."""
     if not user:
-        return False, len(KNOWN_USERS)
-    with USERS_LOCK:
-        is_new = user.id not in KNOWN_USERS
+        return False, len(DB["users"])
+    suid = str(user.id)
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+    username = user.username or ""
+    ts = now_bd_str()
+
+    with DB_LOCK:
+        is_new = suid not in DB["users"]
         if is_new:
-            KNOWN_USERS.add(user.id)
-            save_known_users()
-        return is_new, len(KNOWN_USERS)
+            DB["users"][suid] = {
+                "id": user.id,
+                "name": full_name,
+                "username": username,
+                "joined_at": ts,
+                "last_active": ts,
+                "searches": 0,
+                "downloads": 0,
+                "audio_downloads": 0,
+                "video_downloads": 0,
+                "history": []
+            }
+        else:
+            DB["users"][suid]["name"] = full_name
+            DB["users"][suid]["username"] = username
+            DB["users"][suid]["last_active"] = ts
+        save_db()
+        return is_new, len(DB["users"])
+
+
+def record_search(user):
+    if not user:
+        return
+    ensure_user_in_db(user)
+    suid = str(user.id)
+    with DB_LOCK:
+        DB["users"][suid]["searches"] = DB["users"][suid].get("searches", 0) + 1
+        DB["users"][suid]["last_active"] = now_bd_str()
+        save_db()
+
+
+def record_download(user, title: str, media_fmt: str):
+    if not user:
+        return
+    ensure_user_in_db(user)
+    suid = str(user.id)
+    short_ts = now_bd_str(short=True)
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "User"
+    username = user.username or ""
+
+    with DB_LOCK:
+        u = DB["users"][suid]
+        u["downloads"] = u.get("downloads", 0) + 1
+        if media_fmt == "MP3":
+            u["audio_downloads"] = u.get("audio_downloads", 0) + 1
+        else:
+            u["video_downloads"] = u.get("video_downloads", 0) + 1
+        u["last_active"] = now_bd_str()
+
+        history = u.setdefault("history", [])
+        history.append({"title": title[:80], "type": media_fmt, "time": short_ts})
+        if len(history) > 25:
+            u["history"] = history[-25:]
+
+        DB["recent"].append({
+            "user_id": user.id,
+            "name": full_name,
+            "username": username,
+            "title": title[:80],
+            "type": media_fmt,
+            "time": short_ts
+        })
+        if len(DB["recent"]) > 30:
+            DB["recent"] = DB["recent"][-30:]
+
+        save_db()
 
 
 def notify_admin_new_user(message, total_users: int):
@@ -123,9 +229,12 @@ def notify_admin_new_user(message, total_users: int):
 
     parts = (message.text or "").split(maxsplit=1)
     start_param = html.escape(parts[1].strip()) if len(parts) > 1 else "None"
+    now_str = now_bd_str()
 
-    bd_tz = timezone(timedelta(hours=6))
-    now_str = datetime.now(bd_tz).strftime("%d-%m-%Y %I:%M:%S %p (BD)")
+    profile_line = (
+        f'\n🔗 <b>Profile Link:</b> https://t.me/{html.escape(user.username)}'
+        if user.username else ""
+    )
 
     admin_text = (
         "🆕 <b>New User Started the Bot!</b>\n\n"
@@ -134,7 +243,7 @@ def notify_admin_new_user(message, total_users: int):
         f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
         f"📛 <b>First Name:</b> {first_name}\n"
         f"📛 <b>Last Name:</b> {last_name}\n"
-        f"🔗 <b>Username:</b> {username}\n"
+        f"🔗 <b>Username:</b> {username}{profile_line}\n"
         f"🌐 <b>Language:</b> <code>{lang}</code>\n"
         f"⭐ <b>Telegram Premium:</b> {is_premium}\n"
         f"🤖 <b>Is Bot:</b> {is_bot}\n"
@@ -145,21 +254,113 @@ def notify_admin_new_user(message, total_users: int):
         "</blockquote>"
     )
 
-    markup = None
-    if user.username:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(
-                "🔗 Open User Profile", url=f"https://t.me/{user.username}"
-            )
-        )
-
     for admin_id in ADMIN_IDS:
         try:
-            bot.send_message(admin_id, admin_text, reply_markup=markup)
+            bot.send_message(admin_id, admin_text)
         except Exception as e:
             logger.warning(f"Failed to notify admin {admin_id}: {e}")
 
+
+# ============================================================
+# Colored Reply Keyboards (NO Inline Buttons)
+# ============================================================
+
+def kb_btn(text: str, style: str = None) -> types.KeyboardButton:
+    """Create a colored Reply Keyboard button (primary=blue, success=green, danger=red)."""
+    if style:
+        return types.KeyboardButton(text, style=style)
+    return types.KeyboardButton(text)
+
+
+def get_main_keyboard(user_id: int = 0) -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(
+        kb_btn("🔍 Search Music", style="primary"),
+        kb_btn("⚡ Server Status", style="success")
+    )
+    markup.row(
+        kb_btn("📖 Help & Guide", style="primary"),
+        kb_btn("✖️ Hide Menu", style="danger")
+    )
+    if is_admin(user_id):
+        markup.row(kb_btn("👑 Admin Panel", style="success"))
+    return markup
+
+
+def get_search_results_keyboard(count: int) -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    for i in range(min(count, 5)):
+        em = number_emojis[i]
+        markup.row(
+            kb_btn(f"{em} 🎵 MP3", style="success"),
+            kb_btn(f"{em} 🎬 MP4", style="primary")
+        )
+    markup.row(kb_btn("🔙 Main Menu", style="danger"))
+    return markup
+
+
+def get_direct_link_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(
+        kb_btn("🎵 Download MP3 (192k)", style="success"),
+        kb_btn("🎬 Download MP4 (HD)", style="primary")
+    )
+    markup.row(kb_btn("❌ Cancel", style="danger"))
+    return markup
+
+
+def get_admin_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(
+        kb_btn("👥 All Users", style="primary"),
+        kb_btn("📊 User Stats", style="success")
+    )
+    markup.row(
+        kb_btn("🔍 User Details", style="primary"),
+        kb_btn("📥 Recent Downloads", style="success")
+    )
+    markup.row(kb_btn("🔙 Main Menu", style="danger"))
+    return markup
+
+
+def get_admin_back_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(kb_btn("🔙 Back to Admin Panel", style="danger"))
+    return markup
+
+
+def send_long_message(chat_id: int, text: str, reply_markup=None):
+    """Safely send messages exceeding Telegram's 4096 character limit."""
+    if len(text) <= 4000:
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return
+
+    lines = text.split("\n")
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 3800:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+
+    for idx, chunk in enumerate(chunks):
+        rm = reply_markup if idx == len(chunks) - 1 else None
+        try:
+            bot.send_message(chat_id, chunk, reply_markup=rm)
+        except Exception:
+            # Fallback without HTML in case a split broke a tag
+            plain = re.sub(r"<[^>]+>", "", chunk)
+            bot.send_message(chat_id, plain, parse_mode=None, reply_markup=rm)
+
+
+# ============================================================
+# Core Helpers & Download Engine
+# ============================================================
 
 class FileTooLargeError(Exception):
     def __init__(self, size_bytes: int):
@@ -180,6 +381,22 @@ def cache_put(chat_id: int, vid: str, meta: dict):
     chat_cache.move_to_end(vid)
     while len(chat_cache) > MAX_ITEMS_PER_CHAT:
         chat_cache.popitem(last=False)
+
+
+def set_last_search(chat_id: int, vids: list):
+    if chat_id in LAST_SEARCH_RESULTS:
+        LAST_SEARCH_RESULTS.move_to_end(chat_id)
+    elif len(LAST_SEARCH_RESULTS) >= MAX_CACHED_CHATS:
+        LAST_SEARCH_RESULTS.popitem(last=False)
+    LAST_SEARCH_RESULTS[chat_id] = vids
+
+
+def set_direct_video(chat_id: int, vid: str):
+    if chat_id in DIRECT_VIDEO_CACHE:
+        DIRECT_VIDEO_CACHE.move_to_end(chat_id)
+    elif len(DIRECT_VIDEO_CACHE) >= MAX_CACHED_CHATS:
+        DIRECT_VIDEO_CACHE.popitem(last=False)
+    DIRECT_VIDEO_CACHE[chat_id] = vid
 
 
 def parse_duration_seconds(d_str: str) -> int:
@@ -355,7 +572,7 @@ def convert_to_mp3(input_path: str, output_path: str, title: str, artist: str) -
         "-id3v2_version", "3",
         "-metadata", f"title={title}",
         "-metadata", f"artist={artist}",
-        "-metadata", "album=XZ Music Bot",
+        "-metadata", "album=YouTube Music",
         output_path
     ]
     try:
@@ -385,9 +602,9 @@ def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> bool:
         return False
 
 
-def safe_edit_message(text: str, chat_id: int, message_id: int, reply_markup=None):
+def safe_edit_message(text: str, chat_id: int, message_id: int):
     try:
-        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
     except ApiTelegramException as e:
         if e.error_code == 429:
             retry_after = int(e.result_json.get("parameters", {}).get("retry_after", 3))
@@ -463,37 +680,37 @@ def download_with_progress(
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
+# ============================================================
+# Welcome & User Commands
+# ============================================================
+
 def get_bold_start_text(user) -> str:
     user_name = html.escape(user.first_name if user and user.first_name else "there")
     user_id = user.id if user else 0
     mention = f'<a href="tg://user?id={user_id}"><b>{user_name}</b></a>' if user_id else f"<b>{user_name}</b>"
 
     return (
-        f"Hi, {mention}! Turn a YouTube link or title into audio or video.\n\n"
+        f"✨ <b>Hi, {mention}!</b> Turn a YouTube link or title into audio or video.\n\n"
         "<blockquote>"
-        "🎵 <b>Download MP3 audio</b>\n"
-        "🎬 <b>Download MP4 video</b>\n"
-        "🔍 <b>Search YouTube</b>"
+        "🎵 <b>Download MP3 audio</b> — 192 kbps + Cover Art\n"
+        "🎬 <b>Download MP4 video</b> — HD Quality\n"
+        "🔍 <b>Search YouTube</b> — Instant Results"
         "</blockquote>\n\n"
         "💡 <i>Use a title, artist, or direct YouTube link.</i>\n"
-        "⚡ <i>Powered by XVIBERZ</i>"
+        "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
     )
-
-
-def get_clean_start_keyboard() -> types.InlineKeyboardMarkup:
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn_search = types.InlineKeyboardButton("🔍 Search Music", callback_data="info:search_guide")
-    btn_status = types.InlineKeyboardButton("⚡ Server Status", callback_data="info:api_status")
-    markup.add(btn_search, btn_status)
-    return markup
 
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    text = get_bold_start_text(message.from_user)
-    bot.reply_to(message, text, reply_markup=get_clean_start_keyboard())
+    uid = message.from_user.id if message.from_user else 0
+    if uid in ADMIN_STATE:
+        ADMIN_STATE.pop(uid, None)
 
-    is_new, total_users = register_user_if_new(message.from_user)
+    text = get_bold_start_text(message.from_user)
+    bot.reply_to(message, text, reply_markup=get_main_keyboard(uid))
+
+    is_new, total_users = ensure_user_in_db(message.from_user)
     if is_new and ADMIN_IDS:
         threading.Thread(
             target=notify_admin_new_user,
@@ -504,18 +721,18 @@ def cmd_start(message):
 
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
+    uid = message.from_user.id if message.from_user else 0
     help_text = (
-        "📖 <b>Bot Commands & Help</b>\n\n"
+        "📖 <b>Bot Commands &amp; Help</b>\n\n"
         "<blockquote>"
         "• <code>/search &lt;query&gt;</code> — Search YouTube\n"
         "• <code>/ping</code> — Check response latency\n"
         "• <code>/status</code> — Check server health"
         "</blockquote>\n\n"
-        "💡 <i>Or just type any song or artist name directly in this chat!</i>"
+        "💡 <i>Or just type any song name or paste a YouTube link directly!</i>\n"
+        "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
     )
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="info:back_home"))
-    bot.reply_to(message, help_text, reply_markup=markup)
+    bot.reply_to(message, help_text, reply_markup=get_main_keyboard(uid))
 
 
 @bot.message_handler(commands=["ping"])
@@ -528,7 +745,29 @@ def cmd_ping(message):
 
 @bot.message_handler(commands=["status"])
 def cmd_status(message):
-    wait_msg = bot.reply_to(message, "🔄 <i>Checking status...</i>")
+    send_server_status(message.chat.id, message.from_user.id if message.from_user else 0)
+
+
+@bot.message_handler(commands=["search", "song", "play"])
+def cmd_search(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "ℹ️ <b>Usage:</b> <code>/search &lt;song or artist name&gt;</code>\n<i>Example:</i> <code>/search Kesariya</code>")
+        return
+    perform_search(message.chat.id, message.from_user, parts[1].strip())
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin(uid):
+        bot.reply_to(message, "⛔ <b>Access Denied.</b> This command is for Admin only.")
+        return
+    open_admin_panel(message.chat.id, uid)
+
+
+def send_server_status(chat_id: int, user_id: int):
+    wait_msg = bot.send_message(chat_id, "🔄 <i>Checking status...</i>")
     try:
         r = http_session.get(f"{API_BASE}/health", timeout=5)
         status_text = (
@@ -538,90 +777,341 @@ def cmd_status(message):
             "🎵 <b>Audio Quality:</b> 192 kbps MP3 (ID3)\n"
             "🎬 <b>Video Quality:</b> HD MP4\n"
             "🚀 <b>Network:</b> Cloud-Accelerated CDN"
-            "</blockquote>"
+            "</blockquote>\n\n"
+            "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
         ) if r.status_code == 200 else f"🟡 Status Code: {r.status_code}"
     except Exception as e:
         status_text = f"🔴 Connection error: {html.escape(str(e))}"
-    bot.edit_message_text(status_text, chat_id=message.chat.id, message_id=wait_msg.message_id)
+    bot.edit_message_text(status_text, chat_id=chat_id, message_id=wait_msg.message_id)
 
 
-@bot.message_handler(commands=["search", "song", "play"])
-def cmd_search(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "ℹ️ <b>Usage:</b> <code>/search &lt;song or artist name&gt;</code>\n<i>Example:</i> <code>/search Kesariya</code>")
+# ============================================================
+# Admin Panel & User Management (ADMIN ONLY)
+# ============================================================
+
+def open_admin_panel(chat_id: int, admin_id: int):
+    if not is_admin(admin_id):
         return
-    perform_search(message.chat.id, parts[1].strip())
+    ADMIN_STATE.pop(admin_id, None)
+
+    with DB_LOCK:
+        total_users = len(DB["users"])
+        total_searches = sum(u.get("searches", 0) for u in DB["users"].values())
+        total_downloads = sum(u.get("downloads", 0) for u in DB["users"].values())
+        total_mp3 = sum(u.get("audio_downloads", 0) for u in DB["users"].values())
+        total_mp4 = sum(u.get("video_downloads", 0) for u in DB["users"].values())
+
+    text = (
+        "👑 <b>Admin Panel — User Management</b>\n\n"
+        "<blockquote>"
+        f"👥 <b>Total Users:</b> <code>{total_users}</code>\n"
+        f"🔍 <b>Total Searches:</b> <code>{total_searches}</code>\n"
+        f"📥 <b>Total Downloads:</b> <code>{total_downloads}</code>\n"
+        f"   ├ 🎵 <b>MP3:</b> <code>{total_mp3}</code>\n"
+        f"   └ 🎬 <b>MP4:</b> <code>{total_mp4}</code>"
+        "</blockquote>\n\n"
+        "👇 <i>নিচের বাটন থেকে অপশন সিলেক্ট করুন:</i>"
+    )
+    bot.send_message(chat_id, text, reply_markup=get_admin_keyboard())
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("info:"))
-def handle_info_callbacks(call):
-    action = call.data.split(":")[1]
+def handle_admin_all_users(chat_id: int, admin_id: int):
+    if not is_admin(admin_id):
+        return
+    with DB_LOCK:
+        users_list = list(DB["users"].values())
 
-    if action == "search_guide":
-        text = (
-            "🔍 <b>How to Search:</b>\n\n"
-            "<blockquote>"
-            "• Type any song title: <code>Kesariya</code>\n"
-            "• Search artist: <code>Tanveer Evan song</code>\n"
-            "• Search playlist: <code>Bollywood 90s hits</code>\n"
-            "• Direct link: <code>https://youtu.be/...</code>"
-            "</blockquote>\n\n"
-            "👇 <i>Just type your query in this chat!</i>"
+    if not users_list:
+        bot.send_message(chat_id, "👥 কোনো ইউজার পাওয়া যায়নি।", reply_markup=get_admin_keyboard())
+        return
+
+    lines = [f"👥 <b>All Bot Users ({len(users_list)})</b>\n"]
+    for idx, u in enumerate(users_list, 1):
+        uid = u.get("id")
+        name = html.escape(u.get("name", "User"))
+        uname = f"@{html.escape(u['username'])}" if u.get("username") else "No Username"
+        searches = u.get("searches", 0)
+        downloads = u.get("downloads", 0)
+        lines.append(
+            f"<b>{idx}.</b> <a href=\"tg://user?id={uid}\">{name}</a> ({uname})\n"
+            f"   └ 🆔 <code>{uid}</code> | 🔍 <code>{searches}</code> | 📥 <code>{downloads}</code>"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="info:back_home"))
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
 
-    elif action == "api_status":
-        bot.answer_callback_query(call.id, "Checking server status...")
-        try:
-            r = http_session.get(f"{API_BASE}/health", timeout=5)
-            status_desc = "🟢 Online (Optimal)" if r.status_code == 200 else f"🟡 Code {r.status_code}"
-        except Exception:
-            status_desc = "🔴 Unavailable"
+    lines.append("\n💡 <i>নির্দিষ্ট ইউজারের হিস্ট্রি দেখতে</i> <b>🔍 User Details</b> <i>চাপুন।</i>")
+    send_long_message(chat_id, "\n".join(lines), reply_markup=get_admin_keyboard())
 
-        text = (
-            "⚡ <b>Engine Status:</b>\n\n"
-            "<blockquote>"
-            f"• <b>Status:</b> {status_desc}\n"
-            "• <b>Audio:</b> 192 kbps MP3 with ID3 Tags\n"
-            "• <b>Video:</b> HD MP4 with Audio Mapping\n"
-            "• <b>Speed:</b> Cloud CDN Optimized"
-            "</blockquote>"
+
+def handle_admin_user_stats(chat_id: int, admin_id: int):
+    if not is_admin(admin_id):
+        return
+    with DB_LOCK:
+        users_list = list(DB["users"].values())
+
+    if not users_list:
+        bot.send_message(chat_id, "📊 এখনো কোনো ইউজার ডেটা নেই।", reply_markup=get_admin_keyboard())
+        return
+
+    # Sort by downloads desc, then searches desc
+    users_sorted = sorted(
+        users_list,
+        key=lambda x: (x.get("downloads", 0), x.get("searches", 0)),
+        reverse=True
+    )
+
+    lines = [f"📊 <b>User Activity Stats ({len(users_sorted)} Users)</b>\n"]
+    for idx, u in enumerate(users_sorted, 1):
+        uid = u.get("id")
+        name = html.escape(u.get("name", "User"))
+        uname = f"@{html.escape(u['username'])}" if u.get("username") else f"ID:{uid}"
+        s_cnt = u.get("searches", 0)
+        d_cnt = u.get("downloads", 0)
+        mp3_cnt = u.get("audio_downloads", 0)
+        mp4_cnt = u.get("video_downloads", 0)
+        history = u.get("history", [])
+
+        last_items = ""
+        if history:
+            recent_titles = [f"<code>[{h['type']}]</code> {html.escape(h['title'])}" for h in history[-3:]]
+            last_items = "\n   └ 🎶 <i>Latest:</i> " + " | ".join(recent_titles)
+
+        lines.append(
+            f"<b>{idx}. {name}</b> ({uname}) • 🆔 <code>{uid}</code>\n"
+            f"   ├ 🔍 Searches: <code>{s_cnt}</code> | 📥 Downloads: <code>{d_cnt}</code> (MP3: <code>{mp3_cnt}</code>, MP4: <code>{mp4_cnt}</code>)"
+            f"{last_items}"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="info:back_home"))
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
 
-    elif action == "back_home":
-        text = get_bold_start_text(call.from_user)
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_clean_start_keyboard())
+    send_long_message(chat_id, "\n".join(lines), reply_markup=get_admin_keyboard())
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "close_panel")
-def handle_close_panel(call):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
+def handle_admin_recent_downloads(chat_id: int, admin_id: int):
+    if not is_admin(admin_id):
+        return
+    with DB_LOCK:
+        recent = list(reversed(DB["recent"]))
 
+    if not recent:
+        bot.send_message(chat_id, "📥 এখনো কোনো ডাউনলোড হয়নি।", reply_markup=get_admin_keyboard())
+        return
+
+    lines = [f"📥 <b>Recent Downloads (Last {len(recent)})</b>\n"]
+    for idx, item in enumerate(recent, 1):
+        name = html.escape(item.get("name", "User"))
+        uname = f"@{html.escape(item['username'])}" if item.get("username") else f"ID:{item.get('user_id')}"
+        title = html.escape(item.get("title", "Track"))
+        mtype = item.get("type", "MP3")
+        ts = item.get("time", "")
+        lines.append(
+            f"<b>{idx}. [{mtype}]</b> {title}\n"
+            f"   └ 👤 {name} ({uname}) • 🕒 <code>{ts}</code>"
+        )
+
+    send_long_message(chat_id, "\n".join(lines), reply_markup=get_admin_keyboard())
+
+
+def handle_admin_user_lookup(chat_id: int, admin_id: int, query_str: str):
+    if not is_admin(admin_id):
+        return
+    q = query_str.strip().lstrip("@").lower()
+
+    found = None
+    with DB_LOCK:
+        if query_str.strip() in DB["users"]:
+            found = DB["users"][query_str.strip()]
+        else:
+            for u in DB["users"].values():
+                if str(u.get("id")) == q or (u.get("username") or "").lower() == q:
+                    found = u
+                    break
+
+    if not found:
+        bot.send_message(
+            chat_id,
+            f"❌ <b>User Not Found:</b> <code>{html.escape(query_str)}</code>\n"
+            "সঠিক User ID অথবা @username পাঠান।",
+            reply_markup=get_admin_back_keyboard()
+        )
+        return
+
+    uid = found.get("id")
+    name = html.escape(found.get("name", "User"))
+    uname = f"@{html.escape(found['username'])}" if found.get("username") else "None"
+    joined = found.get("joined_at", "Unknown")
+    last_active = found.get("last_active", "Unknown")
+    searches = found.get("searches", 0)
+    downloads = found.get("downloads", 0)
+    mp3_cnt = found.get("audio_downloads", 0)
+    mp4_cnt = found.get("video_downloads", 0)
+    history = found.get("history", [])
+
+    lines = [
+        f"👤 <b>User Full Report: <a href=\"tg://user?id={uid}\">{name}</a></b>\n",
+        "<blockquote>",
+        f"🆔 <b>User ID:</b> <code>{uid}</code>",
+        f"🔗 <b>Username:</b> {uname}",
+        f"📅 <b>Joined:</b> <code>{joined}</code>",
+        f"🕒 <b>Last Active:</b> <code>{last_active}</code>",
+        f"🔍 <b>Total Searches:</b> <code>{searches}</code>",
+        f"📥 <b>Total Downloads:</b> <code>{downloads}</code> (🎵 MP3: <code>{mp3_cnt}</code> | 🎬 MP4: <code>{mp4_cnt}</code>)",
+        "</blockquote>\n"
+    ]
+
+    if history:
+        lines.append(f"🎶 <b>Downloaded Items (Last {len(history)}):</b>")
+        for idx, h in enumerate(reversed(history), 1):
+            lines.append(f"{idx}. <code>[{h['type']}]</code> {html.escape(h['title'])} <i>({h['time']})</i>")
+    else:
+        lines.append("🎶 <b>Downloaded Items:</b> <i>এখনো কিছু ডাউনলোড করেনি।</i>")
+
+    ADMIN_STATE.pop(admin_id, None)
+    send_long_message(chat_id, "\n".join(lines), reply_markup=get_admin_keyboard())
+
+
+# ============================================================
+# Text & Reply Keyboard Button Router
+# ============================================================
 
 @bot.message_handler(content_types=["text"], func=lambda msg: bool(msg.text and not msg.text.startswith("/")))
 def handle_text_query(message):
-    query = message.text.strip()
-    if not query:
+    text = message.text.strip()
+    if not text:
         return
 
-    vid = extract_video_id(query)
+    chat_id = message.chat.id
+    user = message.from_user
+    uid = user.id if user else 0
+    ensure_user_in_db(user)
+
+    # 1) Main Menu & Cancel Keyboard Buttons
+    if text == "🔙 Main Menu" or text == "❌ Cancel":
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(
+            chat_id,
+            "🏠 <b>Main Menu</b>\n💡 <i>যেকোনো গানের নাম বা YouTube লিংক পাঠান!</i>",
+            reply_markup=get_main_keyboard(uid)
+        )
+        return
+
+    if text == "✖️ Hide Menu":
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(
+            chat_id,
+            "✅ <b>Menu hidden.</b> আবার মেনু চালু করতে <code>/start</code> লিখুন।",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        return
+
+    if text == "🔍 Search Music":
+        bot.send_message(
+            chat_id,
+            "🔍 <b>How to Search:</b>\n\n"
+            "<blockquote>"
+            "• যেকোনো গানের নাম লিখুন: <code>Kesariya</code>\n"
+            "• শিল্পীর নাম লিখুন: <code>Tanveer Evan song</code>\n"
+            "• সরাসরি YouTube লিংক দিন: <code>https://youtu.be/...</code>"
+            "</blockquote>\n\n"
+            "👇 <i>এখন চ্যাটে গানের নাম বা লিংক পাঠান!</i>",
+            reply_markup=get_main_keyboard(uid)
+        )
+        return
+
+    if text == "⚡ Server Status":
+        send_server_status(chat_id, uid)
+        return
+
+    if text == "📖 Help & Guide":
+        cmd_help(message)
+        return
+
+    # 2) Admin Panel Keyboard Buttons (Strictly Admin Only)
+    if text == "👑 Admin Panel":
+        if is_admin(uid):
+            open_admin_panel(chat_id, uid)
+        return
+
+    if text == "🔙 Back to Admin Panel":
+        if is_admin(uid):
+            open_admin_panel(chat_id, uid)
+        return
+
+    if text == "👥 All Users" and is_admin(uid):
+        ADMIN_STATE.pop(uid, None)
+        handle_admin_all_users(chat_id, uid)
+        return
+
+    if text == "📊 User Stats" and is_admin(uid):
+        ADMIN_STATE.pop(uid, None)
+        handle_admin_user_stats(chat_id, uid)
+        return
+
+    if text == "📥 Recent Downloads" and is_admin(uid):
+        ADMIN_STATE.pop(uid, None)
+        handle_admin_recent_downloads(chat_id, uid)
+        return
+
+    if text == "🔍 User Details" and is_admin(uid):
+        ADMIN_STATE[uid] = "awaiting_user_lookup"
+        bot.send_message(
+            chat_id,
+            "🔍 <b>Check User Details</b>\n\n"
+            "যে ইউজারের ডিটেইলস দেখতে চান তার <b>User ID</b> অথবা <b>@username</b> লিখুন:",
+            reply_markup=get_admin_back_keyboard()
+        )
+        return
+
+    # If Admin is currently entering a User ID / Username to inspect
+    if is_admin(uid) and ADMIN_STATE.get(uid) == "awaiting_user_lookup":
+        handle_admin_user_lookup(chat_id, uid, text)
+        return
+
+    # 3) Search Result Keyboard Buttons (1️⃣ 🎵 MP3 / 1️⃣ 🎬 MP4 ... 5️⃣)
+    m_res = re.match(r"^([1-5])️⃣\s*(🎵 MP3|🎬 MP4)$", text)
+    if m_res:
+        idx = int(m_res.group(1)) - 1
+        media_type = "audio" if "MP3" in m_res.group(2) else "video"
+        vids = LAST_SEARCH_RESULTS.get(chat_id, [])
+        if 0 <= idx < len(vids):
+            process_download(message, media_type, vids[idx])
+        else:
+            bot.send_message(
+                chat_id,
+                "⚠️ <b>Search session expired.</b> অনুগ্রহ করে আবার গানের নাম লিখে সার্চ করুন।",
+                reply_markup=get_main_keyboard(uid)
+            )
+        return
+
+    # 4) Direct YouTube Link Keyboard Buttons
+    if text == "🎵 Download MP3 (192k)":
+        vid = DIRECT_VIDEO_CACHE.get(chat_id)
+        if vid:
+            process_download(message, "audio", vid)
+        else:
+            bot.send_message(chat_id, "⚠️ <b>Link expired.</b> আবার লিংক পাঠান।", reply_markup=get_main_keyboard(uid))
+        return
+
+    if text == "🎬 Download MP4 (HD)":
+        vid = DIRECT_VIDEO_CACHE.get(chat_id)
+        if vid:
+            process_download(message, "video", vid)
+        else:
+            bot.send_message(chat_id, "⚠️ <b>Link expired.</b> আবার লিংক পাঠান।", reply_markup=get_main_keyboard(uid))
+        return
+
+    # 5) Direct YouTube URL or Normal Search Query
+    vid = extract_video_id(text)
     if vid:
-        handle_direct_video(message.chat.id, vid)
+        handle_direct_video(chat_id, user, vid)
         return
 
-    perform_search(message.chat.id, query)
+    perform_search(chat_id, user, text)
 
 
-def perform_search(chat_id: int, query: str):
+# ============================================================
+# Search, Direct Video & Download Flow
+# ============================================================
+
+def perform_search(chat_id: int, user, query: str):
+    uid = user.id if user else 0
+    record_search(user)
     search_msg = bot.send_message(chat_id, f"🔍 <i>Searching for:</i> <b>{html.escape(query)}</b>...")
 
     results = search_youtube(query, limit=5)
@@ -633,8 +1123,11 @@ def perform_search(chat_id: int, query: str):
         )
         return
 
+    vids = []
     for r in results:
         cache_put(chat_id, r["id"], r)
+        vids.append(r["id"])
+    set_last_search(chat_id, vids)
 
     number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     msg_lines = [
@@ -642,31 +1135,29 @@ def perform_search(chat_id: int, query: str):
         "<blockquote>"
     ]
 
-    markup = types.InlineKeyboardMarkup()
-
     for idx, r in enumerate(results):
         emoji_num = number_emojis[idx] if idx < len(number_emojis) else f"{idx+1}."
-        clean_title = html.escape(r['title'])
-        clean_channel = html.escape(r['channel'])
-        duration = r['duration']
-        views = r.get('views', '—')
+        clean_title = html.escape(r["title"])
+        clean_channel = html.escape(r["channel"])
+        duration = r["duration"]
+        views = r.get("views", "—")
 
         msg_lines.append(f"{emoji_num} <b>{clean_title}</b>")
         views_info = f" • 👁 <code>{views}</code>" if views and views != "—" else ""
         msg_lines.append(f"└ 👤 <code>{clean_channel}</code> • ⏱ <code>{duration}</code>{views_info}\n")
 
-        btn_a = types.InlineKeyboardButton(f"{emoji_num} 🎵 MP3", callback_data=f"dl:audio:{r['id']}")
-        btn_v = types.InlineKeyboardButton(f"{emoji_num} 🎬 MP4", callback_data=f"dl:video:{r['id']}")
-        markup.row(btn_a, btn_v)
+    msg_lines.append("</blockquote>\n👇 <b>নিচের রঙিন কিবোর্ড বাটন থেকে MP3 অথবা MP4 বেছে নিন:</b>")
 
-    msg_lines.append("</blockquote>\n👇 <b>Select quality or format below:</b>")
-    markup.row(types.InlineKeyboardButton("🗑 Close", callback_data="close_panel"))
+    bot.edit_message_text("\n".join(msg_lines), chat_id=chat_id, message_id=search_msg.message_id)
+    bot.send_message(
+        chat_id,
+        "🎹 <i>নিচে ১–৫ নম্বরের বাটনগুলো দেওয়া হলো:</i>",
+        reply_markup=get_search_results_keyboard(len(results))
+    )
 
-    full_text = "\n".join(msg_lines)
-    bot.edit_message_text(full_text, chat_id=chat_id, message_id=search_msg.message_id, reply_markup=markup)
 
-
-def handle_direct_video(chat_id: int, vid: str):
+def handle_direct_video(chat_id: int, user, vid: str):
+    record_search(user)
     status_msg = bot.send_message(chat_id, "🔍 <i>Analyzing video...</i>")
     meta = fetch_video_metadata(chat_id, vid)
     title = meta.get("title", "YouTube Video")
@@ -682,11 +1173,7 @@ def handle_direct_video(chat_id: int, vid: str):
     except Exception:
         pass
 
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn_audio = types.InlineKeyboardButton("🎵 Download MP3 (192k)", callback_data=f"dl:audio:{vid}")
-    btn_video = types.InlineKeyboardButton("🎬 Download MP4 (HD)", callback_data=f"dl:video:{vid}")
-    markup.add(btn_audio, btn_video)
-    markup.row(types.InlineKeyboardButton("❌ Cancel", callback_data="close_panel"))
+    set_direct_video(chat_id, vid)
 
     card_text = (
         "🎬 <b>YouTube Media Detected</b>\n\n"
@@ -696,29 +1183,26 @@ def handle_direct_video(chat_id: int, vid: str):
         f"⏰ <b>Duration:</b> <code>{meta.get('duration', '—')}</code>\n"
         f"🆔 <b>Video ID:</b> <code>{vid}</code>"
         "</blockquote>\n\n"
-        "👇 <b>Choose download format:</b>"
+        "👇 <b>নিচের কিবোর্ড থেকে ফরম্যাট সিলেক্ট করুন:</b>"
     )
-    bot.edit_message_text(card_text, chat_id=chat_id, message_id=status_msg.message_id, reply_markup=markup)
+    bot.edit_message_text(card_text, chat_id=chat_id, message_id=status_msg.message_id)
+    bot.send_message(chat_id, "🎹 <i>Format options:</i>", reply_markup=get_direct_link_keyboard())
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
-def handle_download(call):
-    parts = call.data.split(":")
-    if len(parts) != 3:
-        return
-
-    media_type, vid = parts[1], parts[2]
+def process_download(message, media_type: str, vid: str):
+    chat_id = message.chat.id
+    user = message.from_user
+    uid = user.id if user else 0
     is_audio = (media_type == "audio")
     req_format = "m4a" if is_audio else "mp4"
 
-    bot.answer_callback_query(call.id, "Starting download...")
+    # Downloaded by: @username or ID
+    if user and user.username:
+        downloaded_by = f"@{html.escape(user.username)}"
+    else:
+        downloaded_by = f"ID: <code>{uid}</code>"
 
-    user = call.from_user
-    user_name = html.escape(user.first_name if user and user.first_name else "User")
-    user_id = user.id if user else 0
-    user_mention = f'<a href="tg://user?id={user_id}">{user_name}</a>' if user_id else user_name
-
-    meta = fetch_video_metadata(call.message.chat.id, vid)
+    meta = fetch_video_metadata(chat_id, vid)
     title = meta.get("title", "Media Track")
     channel = meta.get("channel", "Unknown Artist")
     duration_str = meta.get("duration", "—")
@@ -733,7 +1217,7 @@ def handle_download(call):
 
     views_info = f"  •  👁 <b>Views:</b> <code>{clean_views}</code>" if clean_views and clean_views != "—" else ""
     status_msg = bot.send_message(
-        call.message.chat.id,
+        chat_id,
         "⚡ <b>Connecting to server...</b>\n\n"
         "<blockquote>"
         f"🎵 <b>{clean_title}</b>\n"
@@ -785,7 +1269,7 @@ def handle_download(call):
         success = download_with_progress(
             url=selected_download_url,
             output_path=raw_tmp.name,
-            chat_id=call.message.chat.id,
+            chat_id=chat_id,
             msg_id=status_msg.message_id,
             title=title,
             channel=channel,
@@ -802,12 +1286,12 @@ def handle_download(call):
 
         if is_audio:
             safe_edit_message(
-                "🎛 <b>Converting to MP3 (192 kbps) & Adding ID3 Tags...</b>\n\n"
+                "🎛 <b>Converting to MP3 (192 kbps) &amp; Adding ID3 Tags...</b>\n\n"
                 "<blockquote>"
                 f"🎵 <b>{clean_title}</b>\n"
                 f"👤 <b>Artist:</b> {clean_channel}"
                 "</blockquote>",
-                call.message.chat.id,
+                chat_id,
                 status_msg.message_id
             )
             mp3_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
@@ -825,7 +1309,7 @@ def handle_download(call):
                 f"🎬 <b>{clean_title}</b>\n"
                 "🔊 Combining high-definition video with audio stream..."
                 "</blockquote>",
-                call.message.chat.id,
+                chat_id,
                 status_msg.message_id
             )
             aud_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
@@ -835,7 +1319,7 @@ def handle_download(call):
             aud_ok = download_with_progress(
                 url=audio_stream_url,
                 output_path=aud_tmp.name,
-                chat_id=call.message.chat.id,
+                chat_id=chat_id,
                 msg_id=status_msg.message_id,
                 title=title,
                 channel=channel,
@@ -872,7 +1356,7 @@ def handle_download(call):
             "</blockquote>\n\n"
             "<code>[▰▰▰▰▰▰▰▰▰▰]</code> <b>100%</b>\n"
             "📤 <i>Delivering track to your chat...</i>",
-            call.message.chat.id,
+            chat_id,
             status_msg.message_id
         )
 
@@ -887,6 +1371,7 @@ def handle_download(call):
         extra_lines.append(f"📦 <b>File Size:</b> {file_size_mb} MB")
         extra_lines_str = "\n".join(extra_lines)
 
+        yt_link = f"https://www.youtube.com/watch?v={vid}"
         caption_text = (
             f"<b>{clean_title}</b>\n\n"
             "<blockquote>"
@@ -895,18 +1380,11 @@ def handle_download(call):
             f"{extra_lines_str}\n"
             f"🎧 <b>Format:</b> {fmt_label}\n"
             f"🛠 <b>Quality:</b> {quality_label}\n"
-            f"🙋‍♂️ <b>Requested by:</b> {user_mention}\n"
-            "🎵 <b>Download by:</b> XVIBERZ"
-            "</blockquote>"
+            f"🙋‍♂️ <b>Downloaded by:</b> {downloaded_by}\n"
+            f"🔗 <a href=\"{yt_link}\">Open on YouTube</a>"
+            "</blockquote>\n\n"
+            "👑 <i>Powered by <b>AYAN AHMED 🛐</b></i>"
         )
-
-        dl_markup = types.InlineKeyboardMarkup()
-        btn_yt = types.InlineKeyboardButton("🔗 Open on YouTube", url=f"https://www.youtube.com/watch?v={vid}")
-        if is_audio:
-            btn_alt = types.InlineKeyboardButton("🎬 Download Video (MP4)", callback_data=f"dl:video:{vid}")
-        else:
-            btn_alt = types.InlineKeyboardButton("🎵 Download Audio (MP3)", callback_data=f"dl:audio:{vid}")
-        dl_markup.row(btn_yt, btn_alt)
 
         clean_filename = re.sub(r'[\\/*?:"<>|]', "", title)[:50] or vid
         sent = False
@@ -916,14 +1394,13 @@ def handle_download(call):
                 try:
                     with open(final_file_path, "rb") as a_file, open(thumb_tmp.name, "rb") as t_file:
                         bot.send_audio(
-                            call.message.chat.id,
+                            chat_id,
                             a_file,
                             title=title,
                             performer=channel,
                             duration=duration_sec,
                             thumbnail=t_file,
                             caption=caption_text,
-                            reply_markup=dl_markup,
                             timeout=120
                         )
                     sent = True
@@ -934,13 +1411,12 @@ def handle_download(call):
                 try:
                     with open(final_file_path, "rb") as a_file:
                         bot.send_audio(
-                            call.message.chat.id,
+                            chat_id,
                             a_file,
                             title=title,
                             performer=channel,
                             duration=duration_sec,
                             caption=caption_text,
-                            reply_markup=dl_markup,
                             timeout=120
                         )
                     sent = True
@@ -950,10 +1426,9 @@ def handle_download(call):
             if not sent:
                 with open(final_file_path, "rb") as a_file:
                     bot.send_document(
-                        call.message.chat.id,
+                        chat_id,
                         a_file,
                         caption=caption_text,
-                        reply_markup=dl_markup,
                         visible_file_name=f"{clean_filename}.{actual_audio_ext}",
                         timeout=120
                     )
@@ -962,23 +1437,21 @@ def handle_download(call):
                 if has_thumb:
                     with open(final_file_path, "rb") as v_file, open(thumb_tmp.name, "rb") as t_file:
                         bot.send_video(
-                            call.message.chat.id,
+                            chat_id,
                             v_file,
                             caption=caption_text,
                             duration=duration_sec,
                             thumbnail=t_file,
-                            reply_markup=dl_markup,
                             supports_streaming=True,
                             timeout=180
                         )
                 else:
                     with open(final_file_path, "rb") as v_file:
                         bot.send_video(
-                            call.message.chat.id,
+                            chat_id,
                             v_file,
                             caption=caption_text,
                             duration=duration_sec,
-                            reply_markup=dl_markup,
                             supports_streaming=True,
                             timeout=180
                         )
@@ -986,45 +1459,42 @@ def handle_download(call):
                 logger.warning(f"send_video failed: {ev}")
                 with open(final_file_path, "rb") as v_file:
                     bot.send_document(
-                        call.message.chat.id,
+                        chat_id,
                         v_file,
                         caption=caption_text,
-                        reply_markup=dl_markup,
                         visible_file_name=f"{clean_filename}.mp4",
                         timeout=180
                     )
 
+        record_download(user, title, "MP3" if is_audio else "MP4")
+
         try:
-            bot.delete_message(call.message.chat.id, status_msg.message_id)
+            bot.delete_message(chat_id, status_msg.message_id)
         except Exception:
             pass
 
     except FileTooLargeError as fle:
         size_mb = round(fle.size_bytes / (1024 * 1024), 1)
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🚀 Direct Download Link", url=selected_download_url))
+        safe_url = html.escape(selected_download_url, quote=True)
         safe_edit_message(
             f"⚠️ <b>File Size: {size_mb} MB</b>\n\n"
             "This file exceeds Telegram's 50 MB bot limit.\n"
-            "Download it directly via your browser below:",
-            call.message.chat.id,
-            status_msg.message_id,
-            reply_markup=markup
+            f"🚀 <a href=\"{safe_url}\"><b>Click Here for Direct Download</b></a>",
+            chat_id,
+            status_msg.message_id
         )
 
     except Exception as exc:
         logger.error(f"Error handling download for {vid}: {exc}", exc_info=True)
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🚀 Direct Download Link", url=selected_download_url))
+        safe_url = html.escape(selected_download_url, quote=True)
         safe_edit_message(
             "❌ <b>Download Error:</b>\n\n"
             "<blockquote>"
             "Could not complete delivery directly to Telegram.\n"
-            "You can download your file via the link below:"
+            f"🚀 <a href=\"{safe_url}\"><b>Try Direct Download Link</b></a>"
             "</blockquote>",
-            call.message.chat.id,
-            status_msg.message_id,
-            reply_markup=markup
+            chat_id,
+            status_msg.message_id
         )
 
     finally:
@@ -1037,9 +1507,9 @@ def handle_download(call):
 
 
 def main():
-    load_known_users()
+    load_db()
     print("=" * 60)
-    print("🚀 XZ Music Bot is running!")
+    print("🚀 Music & Video Bot is running! Powered by AYAN AHMED 🛐")
     print(f"🤖 Connected to Telegram successfully... (Admins: {len(ADMIN_IDS)})")
     print("=" * 60)
     try:
